@@ -674,12 +674,22 @@ public:
         resetStarting.Dismiss();
     }
 
+    // The Stop button and "Stop all": with stream delay on, ask whether to discard it.
     void StopStreaming() override {
+        StopStreaming(true);
+    }
+
+    // askDropDelay=false: the stop follows the profile's delay policy without a
+    // dialog. obs_output_set_delay() in StartStreaming() already carries
+    // OBS_OUTPUT_DELAY_PRESERVE when the profile preserves the cutoff point, so
+    // obs_output_stop() drains or discards the delay exactly as OBS's own
+    // output does.
+    void StopStreaming(bool askDropDelay) {
         if (!IsRunning())
             return;
         
         bool useForce = false;
-        if (isUseDelay_) {
+        if (isUseDelay_ && askDropDelay) {
             auto res = QMessageBox(QMessageBox::Icon::Information,
                 "?",
                 obs_module_text("Ques.DropDelay"),
@@ -708,8 +718,12 @@ public:
                 StartStop();
             }
         } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
+            // A sync stop mirrors the stop the user already requested in OBS.
+            // This runs inside the frontend event callback on the UI thread:
+            // a modal here cannot be answered when the stop came from
+            // obs-websocket, and it blocks the UI until someone does.
             if (IsRunning() && config_->syncStop) {
-                StartStop();
+                StopStreaming(false);
             }
         }
     }
