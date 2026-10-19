@@ -8,6 +8,9 @@
 #include <vector>
 #include <cassert>
 #include <cstring>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 
 #include <QCryptographicHash>
 
@@ -556,7 +559,7 @@ private:
 // An unknown vendor or request is answered by obs-websocket itself (ResourceNotFound, 600).
 //
 // Handlers run on obs-websocket's thread and hop to the UI thread through a
-// module-lifetime dispatcher object with a blocking call; the dock is touched
+// module-lifetime dispatcher object with a timed wait; the dock is touched
 // only there, and after OBS_FRONTEND_EVENT_EXIT every request is refused.
 
 static MultiOutputWidget* s_dock = nullptr;
@@ -617,22 +620,51 @@ static obs_data_t* TargetToData(const OutputTargetConfig& config, bool running)
     return data;
 }
 
-// Runs task on the UI thread and waits for it; false once the module is shutting down.
-static bool RunOnUiThread(std::function<void()> task)
+// One hop to the UI thread. The state is shared between the caller and the queued task,
+// so a task that runs late, or never (the dispatcher's queue is dropped at exit), writes
+// into memory the caller has let go of rather than into obs-websocket's response.
+struct UiCall {
+    std::mutex mutex;
+    std::condition_variable done;
+    bool finished = false;
+    obs_data_t* out = obs_data_create();
+    ~UiCall() { obs_data_release(out); }
+};
+
+// The UI thread stops serving its queue at exit; a caller must not wait on it forever.
+static const int UI_CALL_TIMEOUT_MS = 5000;
+
+// Runs task on the UI thread, waits for it and copies what it wrote into response; false
+// once the module is shutting down or when the UI thread did not answer in time. The
+// wait is a timed one on shared state rather than a blocking queued call, so no caller
+// is stuck on a queue nobody drains, and the dispatcher is never deleted (a QObject left
+// to the process exit), so a callback that passed the shutdown check races nothing.
+static bool RunOnUiThread(std::function<void(obs_data_t*)> task, obs_data_t* response)
 {
     if (s_shuttingDown || s_dispatcher == nullptr)
         return false;
     if (QThread::currentThread() == s_dispatcher->thread()) {
-        task();
+        task(response);
         return true;
     }
-    QMetaObject::invokeMethod(s_dispatcher, [task = std::move(task)]() { task(); }, Qt::BlockingQueuedConnection);
+    auto call = std::make_shared<UiCall>();
+    QMetaObject::invokeMethod(s_dispatcher, [call, task = std::move(task)]() {
+        task(call->out);
+        std::lock_guard<std::mutex> lock(call->mutex);
+        call->finished = true;
+        call->done.notify_all();
+    }, Qt::QueuedConnection);
+    std::unique_lock<std::mutex> lock(call->mutex);
+    bool answered = call->done.wait_for(lock, std::chrono::milliseconds(UI_CALL_TIMEOUT_MS), [&call] { return call->finished; });
+    if (!answered)
+        return false;
+    obs_data_apply(response, call->out);
     return true;
 }
 
 static void OnGetTargets(obs_data_t*, obs_data_t* response, void*)
 {
-    bool ran = RunOnUiThread([response]() {
+    bool ran = RunOnUiThread([](obs_data_t* response) {
         if (s_shuttingDown || s_dock == nullptr) {
             Refuse(response, "shutting down");
             return;
@@ -646,7 +678,7 @@ static void OnGetTargets(obs_data_t*, obs_data_t* response, void*)
         obs_data_set_bool(response, "success", true);
         obs_data_set_array(response, "targets", targets);
         obs_data_array_release(targets);
-    });
+    }, response);
     if (!ran)
         Refuse(response, "shutting down");
 }
@@ -686,7 +718,8 @@ static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
     wanted.syncStart = obs_data_get_bool(request, "sync_start");
     wanted.syncStop = obs_data_get_bool(request, "sync_stop");
 
-    bool ran = RunOnUiThread([&wanted, response]() {
+    // wanted is copied: the task may run after this function returned.
+    bool ran = RunOnUiThread([wanted](obs_data_t* response) {
         if (s_shuttingDown || s_dock == nullptr) {
             Refuse(response, "shutting down");
             return;
@@ -707,7 +740,7 @@ static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
             Refuse(response, "config not saved");
             obs_data_set_bool(response, "applied", true);
         }
-    });
+    }, response);
     if (!ran)
         Refuse(response, "shutting down");
 }
@@ -789,13 +822,13 @@ void obs_module_post_load()
     RegisterVendorApi();
 }
 
+// The dispatcher is kept: a vendor callback that passed the shutdown check may still
+// post to it, and the process is ending anyway. Every task re-checks s_dock.
 void obs_module_unload()
 {
     s_shuttingDown = true;
     UnregisterVendorApi();
     s_dock = nullptr;
-    delete s_dispatcher;
-    s_dispatcher = nullptr;
 }
 
 const char *obs_module_description(void)
