@@ -328,10 +328,11 @@ public:
         return nullptr;
     }
 
+    // Active or starting: in both states the output was built from the target's config.
     bool IsTargetRunning(const std::string& targetId)
     {
         auto widget = FindPushWidget(targetId);
-        return widget != nullptr && widget->IsRunning();
+        return widget != nullptr && widget->IsBusy();
     }
 
     struct TargetState {
@@ -359,7 +360,8 @@ public:
 
     // Writes the target in place (the push widget keeps the same shared object), or appends it.
     // Never rebuilds the dock: a full LoadConfig() destroys every widget and force-stops any
-    // other target that is streaming. A target whose own output is running is refused.
+    // other target that is streaming. A target whose own output is running or starting is
+    // refused: the output already carries the old server and key.
     UpsertResult UpsertTarget(const OutputTargetConfig& wanted)
     {
         UpsertResult result;

@@ -751,6 +751,13 @@ public:
         return output_ != nullptr && obs_output_active(output_); 
     }
 
+    // isStarting_ is set before obs_output_start() and cleared by OnStarted() and
+    // OnStopped(), so the connect phase counts as busy.
+    bool IsBusy() override
+    {
+        return isStarting_ || IsRunning();
+    }
+
     void StartStop()
     {
         if (IsRunning())
