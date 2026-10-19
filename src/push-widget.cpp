@@ -733,6 +733,11 @@ public:
         name_->setText(QString::fromUtf8(config_->name));
     }
 
+    void RefreshConfig() override
+    {
+        LoadConfig();
+    }
+
     void ResetInfo()
     {
         total_frames_ = 0;
@@ -741,7 +746,7 @@ public:
         msg_->setText("");
     }
 
-    bool IsRunning()
+    bool IsRunning() override
     {
         return output_ != nullptr && obs_output_active(output_); 
     }
