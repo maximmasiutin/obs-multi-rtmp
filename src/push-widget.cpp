@@ -120,6 +120,8 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     obs_view_t* scene_view_ = 0;
     bool isUseDelay_ = false;
     std::atomic_bool isStarting_ = false;
+    // UI thread only: set for the whole nested event loop of the edit dialog.
+    bool editing_ = false;
 
     QPushButton* GetDeleteButton() {
         return remove_btn_;
@@ -758,6 +760,11 @@ public:
         return isStarting_ || IsRunning();
     }
 
+    bool IsEditing() override
+    {
+        return editing_;
+    }
+
     void StartStop()
     {
         if (IsRunning())
@@ -781,6 +788,10 @@ public:
     {
         std::unique_ptr<EditOutputWidget> dlg{ createEditOutputWidget(targetid_, (QMainWindow*)obs_frontend_get_main_window()) };
 
+        // A vendor set_target that runs inside dlg->exec() is refused (UpsertTarget), since
+        // the accepted dialog would copy its older snapshot over the change.
+        editing_ = true;
+        auto resetEditing = finally([this] { editing_ = false; });
         if (dlg->exec() == QDialog::DialogCode::Accepted)
         {
             SaveMultiOutputConfig();

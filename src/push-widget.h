@@ -13,6 +13,9 @@ public:
     // The output is active or a start is in flight (the connect phase, where
     // obs_output_active is still false): the config must not change under it.
     virtual bool IsBusy() = 0;
+    // The edit dialog is open: it edits a private copy of the config and writes that copy
+    // back on accept, so a change made in place meanwhile would be overwritten.
+    virtual bool IsEditing() = 0;
     // The target's config object was changed in place (the vendor API): redraw what the widget shows of it.
     virtual void RefreshConfig() = 0;
 };

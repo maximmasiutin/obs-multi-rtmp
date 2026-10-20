@@ -374,6 +374,11 @@ public:
             result.error = "target running";
             return result;
         }
+        // The edit dialog holds a private copy of this config and writes it back on accept.
+        if (auto widget = FindPushWidget(wanted.id); existing && widget != nullptr && widget->IsEditing()) {
+            result.error = "target editing";
+            return result;
+        }
         if (!existing) {
             existing = std::make_shared<OutputTargetConfig>();
             existing->id = wanted.id;
@@ -552,7 +557,9 @@ private:
 //   set_target {id, name, server, key, sync_start, sync_stop}
 //                                     -> { success: true, created, target }
 //                                        { success: false, error: "config not saved", applied: true, target }
-//                                        { success: false, error: "target running" | "missing field: <name>" | "shutting down" }
+//                                        { success: false, error: "target running" | "target editing" | "missing field: <name>"
+//                                                                | "shutting down" | "ui timeout" }
+// After "ui timeout" the queued task may still run and apply the change; the client re-reads.
 // TargetView: id, name, protocol, server, key_sha256 (the key never leaves OBS in
 // clear), sync_start, sync_stop, running, video_encoder, audio_encoder
 // ("stream" | "recording" | "custom"), output_scene (a custom video config's scene).
@@ -634,18 +641,21 @@ struct UiCall {
 // The UI thread stops serving its queue at exit; a caller must not wait on it forever.
 static const int UI_CALL_TIMEOUT_MS = 5000;
 
-// Runs task on the UI thread, waits for it and copies what it wrote into response; false
-// once the module is shutting down or when the UI thread did not answer in time. The
+enum class UiRun { Ran, ShuttingDown, Timeout };
+
+// Runs task on the UI thread, waits for it and copies what it wrote into response;
+// ShuttingDown once the module is shutting down, Timeout when the UI thread did not answer
+// in time (the task stays queued and may still run, so its effect is not undone). The
 // wait is a timed one on shared state rather than a blocking queued call, so no caller
 // is stuck on a queue nobody drains, and the dispatcher is never deleted (a QObject left
 // to the process exit), so a callback that passed the shutdown check races nothing.
-static bool RunOnUiThread(std::function<void(obs_data_t*)> task, obs_data_t* response)
+static UiRun RunOnUiThread(std::function<void(obs_data_t*)> task, obs_data_t* response)
 {
     if (s_shuttingDown || s_dispatcher == nullptr)
-        return false;
+        return UiRun::ShuttingDown;
     if (QThread::currentThread() == s_dispatcher->thread()) {
         task(response);
-        return true;
+        return UiRun::Ran;
     }
     auto call = std::make_shared<UiCall>();
     QMetaObject::invokeMethod(s_dispatcher, [call, task = std::move(task)]() {
@@ -657,14 +667,20 @@ static bool RunOnUiThread(std::function<void(obs_data_t*)> task, obs_data_t* res
     std::unique_lock<std::mutex> lock(call->mutex);
     bool answered = call->done.wait_for(lock, std::chrono::milliseconds(UI_CALL_TIMEOUT_MS), [&call] { return call->finished; });
     if (!answered)
-        return false;
+        return UiRun::Timeout;
     obs_data_apply(response, call->out);
-    return true;
+    return UiRun::Ran;
+}
+
+// The refusal for a task that did not run to completion: a timed-out task may still apply.
+static void RefuseNotRun(obs_data_t* response, UiRun ran)
+{
+    Refuse(response, ran == UiRun::Timeout ? "ui timeout" : "shutting down");
 }
 
 static void OnGetTargets(obs_data_t*, obs_data_t* response, void*)
 {
-    bool ran = RunOnUiThread([](obs_data_t* response) {
+    auto ran = RunOnUiThread([](obs_data_t* response) {
         if (s_shuttingDown || s_dock == nullptr) {
             Refuse(response, "shutting down");
             return;
@@ -679,8 +695,8 @@ static void OnGetTargets(obs_data_t*, obs_data_t* response, void*)
         obs_data_set_array(response, "targets", targets);
         obs_data_array_release(targets);
     }, response);
-    if (!ran)
-        Refuse(response, "shutting down");
+    if (ran != UiRun::Ran)
+        RefuseNotRun(response, ran);
 }
 
 static bool RequireField(obs_data_t* request, obs_data_t* response, const char* field, bool nonEmptyString)
@@ -719,7 +735,7 @@ static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
     wanted.syncStop = obs_data_get_bool(request, "sync_stop");
 
     // wanted is copied: the task may run after this function returned.
-    bool ran = RunOnUiThread([wanted](obs_data_t* response) {
+    auto ran = RunOnUiThread([wanted](obs_data_t* response) {
         if (s_shuttingDown || s_dock == nullptr) {
             Refuse(response, "shutting down");
             return;
@@ -741,8 +757,8 @@ static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
             obs_data_set_bool(response, "applied", true);
         }
     }, response);
-    if (!ran)
-        Refuse(response, "shutting down");
+    if (ran != UiRun::Ran)
+        RefuseNotRun(response, ran);
 }
 
 static void RegisterVendorApi()
