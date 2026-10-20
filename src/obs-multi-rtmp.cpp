@@ -385,10 +385,13 @@ public:
             global.targets.emplace_back(existing);
             result.created = true;
         }
+        // The dock's output settings (bind address, low latency and the like) belong to the
+        // protocol: they survive an update that keeps the protocol and are reset otherwise.
+        if (result.created || existing->protocol != wanted.protocol)
+            existing->outputParam = wanted.outputParam;
         existing->name = wanted.name;
         existing->protocol = wanted.protocol;
         existing->serviceParam = wanted.serviceParam;
-        existing->outputParam = wanted.outputParam;
         existing->syncStart = wanted.syncStart;
         existing->syncStop = wanted.syncStop;
         // A new target starts with both encoders "Reuse the streaming encoder as OBS", rendering
@@ -823,7 +826,10 @@ bool obs_module_load()
             if (event == obs_frontend_event::OBS_FRONTEND_EVENT_EXIT)
             {
                 // From here on a vendor request is refused instead of touching a dock that is going away.
+                // The requests are unregistered here, while obs-websocket's proc handler still exists:
+                // obs_module_unload may run after obs-websocket has unloaded and destroyed it.
                 s_shuttingDown = true;
+                UnregisterVendorApi();
                 dock->SaveConfig();
             }
             else if (event == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_CHANGED)
@@ -843,11 +849,11 @@ void obs_module_post_load()
 }
 
 // The dispatcher is kept: a vendor callback that passed the shutdown check may still
-// post to it, and the process is ending anyway. Every task re-checks s_dock.
+// post to it, and the process is ending anyway. Every task re-checks s_dock. The vendor
+// requests were unregistered at OBS_FRONTEND_EVENT_EXIT, before obs-websocket could unload.
 void obs_module_unload()
 {
     s_shuttingDown = true;
-    UnregisterVendorApi();
     s_dock = nullptr;
 }
 
