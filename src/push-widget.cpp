@@ -122,6 +122,9 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     std::atomic_bool isStarting_ = false;
     // UI thread only: set for the whole nested event loop of the edit dialog.
     bool editing_ = false;
+    // UI thread only: OBS stopped its stream while this output was still connecting,
+    // where obs_output_stop() does nothing; OnStarted() performs the sync stop instead.
+    bool stopPending_ = false;
 
     QPushButton* GetDeleteButton() {
         return remove_btn_;
@@ -608,6 +611,7 @@ public:
             return;
 
         auto resetStarting = finally([this] { isStarting_ = false; });
+        stopPending_ = false;
 
         // recreate output
         ReleaseOutput();
@@ -724,8 +728,12 @@ public:
             // This runs inside the frontend event callback on the UI thread:
             // a modal here cannot be answered when the stop came from
             // obs-websocket, and it blocks the UI until someone does.
-            if (IsRunning() && config_->syncStop) {
-                StopStreaming(false);
+            if (config_->syncStop) {
+                if (IsRunning())
+                    StopStreaming(false);
+                else if (isStarting_)
+                    // Still connecting: the output is not active yet, so OnStarted() stops it.
+                    stopPending_ = true;
             }
         }
     }
@@ -825,6 +833,11 @@ public:
     {
         GetGlobalService().RunInUIThread([this]() {
             isStarting_ = false;
+            if (stopPending_) {
+                stopPending_ = false;
+                StopStreaming(false);
+                return;
+            }
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
@@ -876,6 +889,7 @@ public:
     {
         GetGlobalService().RunInUIThread([this, code]() {
             isStarting_ = false;
+            stopPending_ = false;
             ResetInfo();
             timer_->stop();
 

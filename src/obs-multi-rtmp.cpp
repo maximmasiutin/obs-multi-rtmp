@@ -391,9 +391,12 @@ public:
         existing->outputParam = wanted.outputParam;
         existing->syncStart = wanted.syncStart;
         existing->syncStop = wanted.syncStop;
-        // Both explicitly absent: "Reuse the streaming encoder as OBS", rendering the program scene.
-        existing->videoConfig = std::nullopt;
-        existing->audioConfig = std::nullopt;
+        // A new target starts with both encoders "Reuse the streaming encoder as OBS", rendering
+        // the program scene; an update leaves the encoders chosen in the dock as they are.
+        if (result.created) {
+            existing->videoConfig = std::nullopt;
+            existing->audioConfig = std::nullopt;
+        }
         result.applied = true;
         result.target = existing;
         if (result.created)
@@ -551,8 +554,8 @@ private:
 
 // ======================= obs-websocket vendor API =======================
 //
-// Vendor "obs-multi-rtmp" with two requests, so an obs-websocket client (the
-// Polemica Companion's YouTube setup) can read the targets and write one in place:
+// Vendor "obs-multi-rtmp" with two requests, so an obs-websocket client can read
+// the targets and create or update one in place:
 //   get_targets                       -> { success: true, targets: [TargetView] }
 //   set_target {id, name, server, key, sync_start, sync_stop}
 //                                     -> { success: true, created, target }
@@ -713,6 +716,7 @@ static bool RequireField(obs_data_t* request, obs_data_t* response, const char* 
 
 static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
 {
+    // id, server and key are present and non-empty: a keyless target is not created through this request.
     for (auto field : { "id", "server", "key" }) {
         if (!RequireField(request, response, field, true))
             return;
