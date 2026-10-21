@@ -564,6 +564,7 @@ private:
 //                                     -> { success: true, created, target }
 //                                        { success: false, error: "config not saved", applied: true, target }
 //                                        { success: false, error: "target running" | "target editing" | "missing field: <name>"
+//                                                                | "not a string: <name>" | "not a boolean: <name>"
 //                                                                | "shutting down" | "ui timeout" }
 // After "ui timeout" the queued task may still run and apply the change; the client re-reads.
 // TargetView: id, name, protocol, server, key_sha256 (the key never leaves OBS in
@@ -717,6 +718,16 @@ static bool RequireField(obs_data_t* request, obs_data_t* response, const char* 
     return present;
 }
 
+static bool RequireType(obs_data_t* request, obs_data_t* response, const char* field, obs_data_type type, const char* error)
+{
+    auto item = obs_data_item_byname(request, field);
+    bool matches = item != nullptr && obs_data_item_gettype(item) == type;
+    obs_data_item_release(&item);
+    if (!matches)
+        Refuse(response, std::string(error) + field);
+    return matches;
+}
+
 static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
 {
     // id, server and key are present and non-empty: a keyless target is not created through this request.
@@ -728,16 +739,15 @@ static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
         if (!RequireField(request, response, field, false))
             return;
     }
-    // obs_data_get_bool answers false for a value of another type, which would
-    // save the target with synchronization off.
-    for (auto field : { "sync_start", "sync_stop" }) {
-        auto item = obs_data_item_byname(request, field);
-        bool isBool = item != nullptr && obs_data_item_gettype(item) == OBS_DATA_BOOLEAN;
-        obs_data_item_release(&item);
-        if (!isBool) {
-            Refuse(response, std::string("not a boolean: ") + field);
+    // obs_data_get_string and obs_data_get_bool answer "" and false for a value of
+    // another type, which would save the target with that field cleared.
+    for (auto field : { "id", "name", "server", "key" }) {
+        if (!RequireType(request, response, field, OBS_DATA_STRING, "not a string: "))
             return;
-        }
+    }
+    for (auto field : { "sync_start", "sync_stop" }) {
+        if (!RequireType(request, response, field, OBS_DATA_BOOLEAN, "not a boolean: "))
+            return;
     }
     OutputTargetConfig wanted;
     wanted.id = obs_data_get_string(request, "id");
