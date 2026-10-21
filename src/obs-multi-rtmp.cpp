@@ -728,6 +728,17 @@ static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
         if (!RequireField(request, response, field, false))
             return;
     }
+    // obs_data_get_bool answers false for a value of another type, which would
+    // save the target with synchronization off.
+    for (auto field : { "sync_start", "sync_stop" }) {
+        auto item = obs_data_item_byname(request, field);
+        bool isBool = item != nullptr && obs_data_item_gettype(item) == OBS_DATA_BOOLEAN;
+        obs_data_item_release(&item);
+        if (!isBool) {
+            Refuse(response, std::string("not a boolean: ") + field);
+            return;
+        }
+    }
     OutputTargetConfig wanted;
     wanted.id = obs_data_get_string(request, "id");
     wanted.name = obs_data_get_string(request, "name");
