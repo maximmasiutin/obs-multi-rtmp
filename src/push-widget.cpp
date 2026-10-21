@@ -721,6 +721,9 @@ public:
             Stop();
         } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STARTING) {
             if (!IsRunning() && config_->syncStart) {
+                // A restart during the connect phase cancels the stop the
+                // previous STREAMING_STOPPING left for OnStarted().
+                stopPending_ = false;
                 StartStop();
             }
         } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
