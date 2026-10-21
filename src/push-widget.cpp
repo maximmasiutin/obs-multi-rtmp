@@ -120,6 +120,11 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     obs_view_t* scene_view_ = 0;
     bool isUseDelay_ = false;
     std::atomic_bool isStarting_ = false;
+    // UI thread only: set for the whole nested event loop of the edit dialog.
+    bool editing_ = false;
+    // UI thread only: OBS stopped its stream while this output was still connecting,
+    // where obs_output_stop() does nothing; OnStarted() performs the sync stop instead.
+    bool stopPending_ = false;
 
     QPushButton* GetDeleteButton() {
         return remove_btn_;
@@ -606,6 +611,7 @@ public:
             return;
 
         auto resetStarting = finally([this] { isStarting_ = false; });
+        stopPending_ = false;
 
         // recreate output
         ReleaseOutput();
@@ -674,12 +680,22 @@ public:
         resetStarting.Dismiss();
     }
 
+    // The Stop button and "Stop all": with stream delay on, ask whether to discard it.
     void StopStreaming() override {
+        StopStreaming(true);
+    }
+
+    // askDropDelay=false: the stop follows the profile's delay policy without a
+    // dialog. obs_output_set_delay() in StartStreaming() already carries
+    // OBS_OUTPUT_DELAY_PRESERVE when the profile preserves the cutoff point, so
+    // obs_output_stop() drains or discards the delay exactly as OBS's own
+    // output does.
+    void StopStreaming(bool askDropDelay) {
         if (!IsRunning())
             return;
         
         bool useForce = false;
-        if (isUseDelay_) {
+        if (isUseDelay_ && askDropDelay) {
             auto res = QMessageBox(QMessageBox::Icon::Information,
                 "?",
                 obs_module_text("Ques.DropDelay"),
@@ -705,11 +721,22 @@ public:
             Stop();
         } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STARTING) {
             if (!IsRunning() && config_->syncStart) {
+                // A restart during the connect phase cancels the stop the
+                // previous STREAMING_STOPPING left for OnStarted().
+                stopPending_ = false;
                 StartStop();
             }
         } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
-            if (IsRunning() && config_->syncStop) {
-                StartStop();
+            // A sync stop mirrors the stop the user already requested in OBS.
+            // This runs inside the frontend event callback on the UI thread:
+            // a modal here cannot be answered when the stop came from
+            // obs-websocket, and it blocks the UI until someone does.
+            if (config_->syncStop) {
+                if (IsRunning())
+                    StopStreaming(false);
+                else if (isStarting_)
+                    // Still connecting: the output is not active yet, so OnStarted() stops it.
+                    stopPending_ = true;
             }
         }
     }
@@ -717,6 +744,11 @@ public:
     void LoadConfig()
     {
         name_->setText(QString::fromUtf8(config_->name));
+    }
+
+    void RefreshConfig() override
+    {
+        LoadConfig();
     }
 
     void ResetInfo()
@@ -727,9 +759,21 @@ public:
         msg_->setText("");
     }
 
-    bool IsRunning()
+    bool IsRunning() override
     {
         return output_ != nullptr && obs_output_active(output_); 
+    }
+
+    // isStarting_ is set before obs_output_start() and cleared by OnStarted() and
+    // OnStopped(), so the connect phase counts as busy.
+    bool IsBusy() override
+    {
+        return isStarting_ || IsRunning();
+    }
+
+    bool IsEditing() override
+    {
+        return editing_;
     }
 
     void StartStop()
@@ -755,6 +799,10 @@ public:
     {
         std::unique_ptr<EditOutputWidget> dlg{ createEditOutputWidget(targetid_, (QMainWindow*)obs_frontend_get_main_window()) };
 
+        // A vendor set_target that runs inside dlg->exec() is refused (UpsertTarget), since
+        // the accepted dialog would copy its older snapshot over the change.
+        editing_ = true;
+        auto resetEditing = finally([this] { editing_ = false; });
         if (dlg->exec() == QDialog::DialogCode::Accepted)
         {
             SaveMultiOutputConfig();
@@ -788,6 +836,11 @@ public:
     {
         GetGlobalService().RunInUIThread([this]() {
             isStarting_ = false;
+            if (stopPending_) {
+                stopPending_ = false;
+                StopStreaming(false);
+                return;
+            }
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
@@ -839,6 +892,7 @@ public:
     {
         GetGlobalService().RunInUIThread([this, code]() {
             isStarting_ = false;
+            stopPending_ = false;
             ResetInfo();
             timer_->stop();
 

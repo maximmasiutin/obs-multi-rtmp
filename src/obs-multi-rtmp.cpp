@@ -4,11 +4,22 @@
 #include <regex>
 #include <filesystem>
 #include <unordered_map>
+#include <atomic>
+#include <vector>
+#include <cassert>
+#include <cstring>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
+#include <QCryptographicHash>
 
 #include "push-widget.h"
 #include "plugin-support.h"
+#include "helpers.h"
 
 #include "output-config.h"
+#include "obs-websocket-api.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -301,9 +312,102 @@ public:
         return result;
     }
 
-    void SaveConfig()
+    bool SaveConfig()
     {
-        SaveMultiOutputConfig();
+        return SaveMultiOutputConfig();
+    }
+
+    // ---- vendor API support (see the vendor section below the class) ----
+
+    PushWidget* FindPushWidget(const std::string& targetId)
+    {
+        const QString id = QString::fromStdString(targetId);
+        for (int row = 0; row < outputsContainer_->count(); ++row) {
+            auto item = outputsContainer_->item(row);
+            if (!item || item->data(Qt::UserRole).toString() != id)
+                continue;
+            return dynamic_cast<PushWidget*>(outputsContainer_->itemWidget(item));
+        }
+        return nullptr;
+    }
+
+    // Active or starting: in both states the output was built from the target's config.
+    bool IsTargetRunning(const std::string& targetId)
+    {
+        auto widget = FindPushWidget(targetId);
+        return widget != nullptr && widget->IsBusy();
+    }
+
+    struct TargetState {
+        OutputTargetConfigPtr config;
+        bool running;
+    };
+
+    std::vector<TargetState> ViewTargets()
+    {
+        std::vector<TargetState> result;
+        for (auto& target : GlobalMultiOutputConfig().targets) {
+            if (target)
+                result.push_back({ target, IsTargetRunning(target->id) });
+        }
+        return result;
+    }
+
+    struct UpsertResult {
+        bool applied = false;
+        bool created = false;
+        bool saved = false;
+        std::string error;
+        OutputTargetConfigPtr target;
+    };
+
+    // Writes the target in place (the push widget keeps the same shared object), or appends it.
+    // Never rebuilds the dock: a full LoadConfig() destroys every widget and force-stops any
+    // other target that is streaming. A target whose own output is running or starting is
+    // refused: the output already carries the old server and key.
+    UpsertResult UpsertTarget(const OutputTargetConfig& wanted)
+    {
+        UpsertResult result;
+        auto& global = GlobalMultiOutputConfig();
+        auto existing = FindById(global.targets, wanted.id);
+        if (existing && IsTargetRunning(wanted.id)) {
+            result.error = "target running";
+            return result;
+        }
+        // The edit dialog holds a private copy of this config and writes it back on accept.
+        if (auto widget = FindPushWidget(wanted.id); existing && widget != nullptr && widget->IsEditing()) {
+            result.error = "target editing";
+            return result;
+        }
+        if (!existing) {
+            existing = std::make_shared<OutputTargetConfig>();
+            existing->id = wanted.id;
+            global.targets.emplace_back(existing);
+            result.created = true;
+        }
+        // The dock's output settings (bind address, low latency and the like) belong to the
+        // protocol: they survive an update that keeps the protocol and are reset otherwise.
+        if (result.created || existing->protocol != wanted.protocol)
+            existing->outputParam = wanted.outputParam;
+        existing->name = wanted.name;
+        existing->protocol = wanted.protocol;
+        existing->serviceParam = wanted.serviceParam;
+        existing->syncStart = wanted.syncStart;
+        existing->syncStop = wanted.syncStop;
+        // A new target starts with both encoders "Reuse the streaming encoder as OBS", rendering
+        // the program scene; an update leaves the encoders chosen in the dock as they are.
+        if (result.created) {
+            existing->videoConfig = std::nullopt;
+            existing->audioConfig = std::nullopt;
+        }
+        result.applied = true;
+        result.target = existing;
+        if (result.created)
+            AddPushWidget(existing->id);
+        else if (auto widget = FindPushWidget(existing->id))
+            widget->RefreshConfig();
+        result.saved = SaveConfig();
+        return result;
     }
 
     void OnOutputMoved(
@@ -451,6 +555,261 @@ private:
     }
 };
 
+// ======================= obs-websocket vendor API =======================
+//
+// Vendor "obs-multi-rtmp" with two requests, so an obs-websocket client can read
+// the targets and create or update one in place:
+//   get_targets                       -> { success: true, targets: [TargetView] }
+//   set_target {id, name, server, key, sync_start, sync_stop}
+//                                     -> { success: true, created, target }
+//                                        { success: false, error: "config not saved", applied: true, target }
+//                                        { success: false, error: "target running" | "target editing" | "missing field: <name>"
+//                                                                | "not a string: <name>" | "not a boolean: <name>"
+//                                                                | "shutting down" | "ui timeout" }
+// After "ui timeout" the queued task may still run and apply the change; the client re-reads.
+// TargetView: id, name, protocol, server, key_sha256 (the key never leaves OBS in
+// clear), sync_start, sync_stop, running, video_encoder, audio_encoder
+// ("stream" | "recording" | "custom"), output_scene (a custom video config's scene).
+// An unknown vendor or request is answered by obs-websocket itself (ResourceNotFound, 600).
+//
+// Handlers run on obs-websocket's thread and hop to the UI thread through a
+// module-lifetime dispatcher object with a timed wait; the dock is touched
+// only there, and after OBS_FRONTEND_EVENT_EXIT every request is refused.
+
+static MultiOutputWidget* s_dock = nullptr;
+static QObject* s_dispatcher = nullptr;
+static std::atomic<bool> s_shuttingDown{ false };
+static obs_websocket_vendor s_vendor = nullptr;
+
+static void Refuse(obs_data_t* response, const std::string& error)
+{
+    obs_data_set_bool(response, "success", false);
+    obs_data_set_string(response, "error", error.c_str());
+}
+
+static std::string EncoderKind(const std::optional<std::string>& configId)
+{
+    if (!configId.has_value() || configId->empty() || *configId == OBS_STREAMING_ENC_PLACEHOLDER)
+        return "stream";
+    if (*configId == OBS_RECORDING_ENC_PLACEHOLDER)
+        return "recording";
+    return "custom";
+}
+
+static std::string JsonString(const nlohmann::json& object, const char* key)
+{
+    if (!object.is_object())
+        return "";
+    auto it = object.find(key);
+    if (it == object.end() || !it->is_string())
+        return "";
+    return it->get<std::string>();
+}
+
+static obs_data_t* TargetToData(const OutputTargetConfig& config, bool running)
+{
+    auto data = obs_data_create();
+    obs_data_set_string(data, "id", config.id.c_str());
+    obs_data_set_string(data, "name", config.name.c_str());
+    obs_data_set_string(data, "protocol", config.protocol.c_str());
+    obs_data_set_string(data, "server", JsonString(config.serviceParam, "server").c_str());
+    auto key = JsonString(config.serviceParam, "key");
+    std::string keyHash;
+    if (!key.empty())
+        keyHash = QCryptographicHash::hash(QByteArray::fromStdString(key), QCryptographicHash::Sha256).toHex().toStdString();
+    obs_data_set_string(data, "key_sha256", keyHash.c_str());
+    obs_data_set_bool(data, "sync_start", config.syncStart);
+    obs_data_set_bool(data, "sync_stop", config.syncStop);
+    obs_data_set_bool(data, "running", running);
+    auto videoKind = EncoderKind(config.videoConfig);
+    obs_data_set_string(data, "video_encoder", videoKind.c_str());
+    obs_data_set_string(data, "audio_encoder", EncoderKind(config.audioConfig).c_str());
+    std::string scene;
+    if (videoKind == "custom") {
+        auto videoConfig = FindById(GlobalMultiOutputConfig().videoConfig, *config.videoConfig);
+        if (videoConfig && videoConfig->outputScene.has_value())
+            scene = *videoConfig->outputScene;
+    }
+    obs_data_set_string(data, "output_scene", scene.c_str());
+    return data;
+}
+
+// One hop to the UI thread. The state is shared between the caller and the queued task,
+// so a task that runs late, or never (the dispatcher's queue is dropped at exit), writes
+// into memory the caller has let go of rather than into obs-websocket's response.
+struct UiCall {
+    std::mutex mutex;
+    std::condition_variable done;
+    bool finished = false;
+    obs_data_t* out = obs_data_create();
+    ~UiCall() { obs_data_release(out); }
+};
+
+// The UI thread stops serving its queue at exit; a caller must not wait on it forever.
+static const int UI_CALL_TIMEOUT_MS = 5000;
+
+enum class UiRun { Ran, ShuttingDown, Timeout };
+
+// Runs task on the UI thread, waits for it and copies what it wrote into response;
+// ShuttingDown once the module is shutting down, Timeout when the UI thread did not answer
+// in time (the task stays queued and may still run, so its effect is not undone). The
+// wait is a timed one on shared state rather than a blocking queued call, so no caller
+// is stuck on a queue nobody drains, and the dispatcher is never deleted (a QObject left
+// to the process exit), so a callback that passed the shutdown check races nothing.
+static UiRun RunOnUiThread(std::function<void(obs_data_t*)> task, obs_data_t* response)
+{
+    if (s_shuttingDown || s_dispatcher == nullptr)
+        return UiRun::ShuttingDown;
+    if (QThread::currentThread() == s_dispatcher->thread()) {
+        task(response);
+        return UiRun::Ran;
+    }
+    auto call = std::make_shared<UiCall>();
+    QMetaObject::invokeMethod(s_dispatcher, [call, task = std::move(task)]() {
+        task(call->out);
+        std::lock_guard<std::mutex> lock(call->mutex);
+        call->finished = true;
+        call->done.notify_all();
+    }, Qt::QueuedConnection);
+    std::unique_lock<std::mutex> lock(call->mutex);
+    bool answered = call->done.wait_for(lock, std::chrono::milliseconds(UI_CALL_TIMEOUT_MS), [&call] { return call->finished; });
+    if (!answered)
+        return UiRun::Timeout;
+    obs_data_apply(response, call->out);
+    return UiRun::Ran;
+}
+
+// The refusal for a task that did not run to completion: a timed-out task may still apply.
+static void RefuseNotRun(obs_data_t* response, UiRun ran)
+{
+    Refuse(response, ran == UiRun::Timeout ? "ui timeout" : "shutting down");
+}
+
+static void OnGetTargets(obs_data_t*, obs_data_t* response, void*)
+{
+    auto ran = RunOnUiThread([](obs_data_t* response) {
+        if (s_shuttingDown || s_dock == nullptr) {
+            Refuse(response, "shutting down");
+            return;
+        }
+        auto targets = obs_data_array_create();
+        for (auto& state : s_dock->ViewTargets()) {
+            auto item = TargetToData(*state.config, state.running);
+            obs_data_array_push_back(targets, item);
+            obs_data_release(item);
+        }
+        obs_data_set_bool(response, "success", true);
+        obs_data_set_array(response, "targets", targets);
+        obs_data_array_release(targets);
+    }, response);
+    if (ran != UiRun::Ran)
+        RefuseNotRun(response, ran);
+}
+
+static bool RequireField(obs_data_t* request, obs_data_t* response, const char* field, bool nonEmptyString)
+{
+    bool present = obs_data_has_user_value(request, field);
+    if (present && nonEmptyString) {
+        const char* value = obs_data_get_string(request, field);
+        present = value != nullptr && *value != 0;
+    }
+    if (!present)
+        Refuse(response, std::string("missing field: ") + field);
+    return present;
+}
+
+static bool RequireType(obs_data_t* request, obs_data_t* response, const char* field, obs_data_type type, const char* error)
+{
+    auto item = obs_data_item_byname(request, field);
+    bool matches = item != nullptr && obs_data_item_gettype(item) == type;
+    obs_data_item_release(&item);
+    if (!matches)
+        Refuse(response, std::string(error) + field);
+    return matches;
+}
+
+static void OnSetTarget(obs_data_t* request, obs_data_t* response, void*)
+{
+    // id, server and key are present and non-empty: a keyless target is not created through this request.
+    for (auto field : { "id", "server", "key" }) {
+        if (!RequireField(request, response, field, true))
+            return;
+    }
+    for (auto field : { "name", "sync_start", "sync_stop" }) {
+        if (!RequireField(request, response, field, false))
+            return;
+    }
+    // obs_data_get_string and obs_data_get_bool answer "" and false for a value of
+    // another type, which would save the target with that field cleared.
+    for (auto field : { "id", "name", "server", "key" }) {
+        if (!RequireType(request, response, field, OBS_DATA_STRING, "not a string: "))
+            return;
+    }
+    for (auto field : { "sync_start", "sync_stop" }) {
+        if (!RequireType(request, response, field, OBS_DATA_BOOLEAN, "not a boolean: "))
+            return;
+    }
+    OutputTargetConfig wanted;
+    wanted.id = obs_data_get_string(request, "id");
+    wanted.name = obs_data_get_string(request, "name");
+    wanted.protocol = "RTMP";
+    wanted.serviceParam = nlohmann::json{
+        { "server", obs_data_get_string(request, "server") },
+        { "key", obs_data_get_string(request, "key") },
+        { "use_auth", false },
+    };
+    wanted.outputParam = nlohmann::json::object();
+    wanted.syncStart = obs_data_get_bool(request, "sync_start");
+    wanted.syncStop = obs_data_get_bool(request, "sync_stop");
+
+    // wanted is copied: the task may run after this function returned.
+    auto ran = RunOnUiThread([wanted](obs_data_t* response) {
+        if (s_shuttingDown || s_dock == nullptr) {
+            Refuse(response, "shutting down");
+            return;
+        }
+        auto result = s_dock->UpsertTarget(wanted);
+        if (!result.applied) {
+            Refuse(response, result.error);
+            return;
+        }
+        auto target = TargetToData(*result.target, s_dock->IsTargetRunning(result.target->id));
+        obs_data_set_obj(response, "target", target);
+        obs_data_release(target);
+        obs_data_set_bool(response, "created", result.created);
+        if (result.saved) {
+            obs_data_set_bool(response, "success", true);
+        } else {
+            // The dock shows the change and the next start uses it, but a restart loses it.
+            Refuse(response, "config not saved");
+            obs_data_set_bool(response, "applied", true);
+        }
+    }, response);
+    if (ran != UiRun::Ran)
+        RefuseNotRun(response, ran);
+}
+
+static void RegisterVendorApi()
+{
+    s_vendor = obs_websocket_register_vendor("obs-multi-rtmp");
+    if (s_vendor == nullptr) {
+        blog(LOG_INFO, TAG "obs-websocket not available: vendor API not registered");
+        return;
+    }
+    obs_websocket_vendor_register_request(s_vendor, "get_targets", OnGetTargets, nullptr);
+    obs_websocket_vendor_register_request(s_vendor, "set_target", OnSetTarget, nullptr);
+    blog(LOG_INFO, TAG "vendor API registered: get_targets, set_target");
+}
+
+static void UnregisterVendorApi()
+{
+    if (s_vendor == nullptr)
+        return;
+    obs_websocket_vendor_unregister_request(s_vendor, "get_targets");
+    obs_websocket_vendor_unregister_request(s_vendor, "set_target");
+    s_vendor = nullptr;
+}
+
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-multi-rtmp", "en-US")
 OBS_MODULE_AUTHOR("雷鳴 (@sorayukinoyume)")
@@ -471,6 +830,10 @@ bool obs_module_load()
         delete dock;
         return false;
     }
+    // Module load runs on the UI thread (the dock above is built here): the dispatcher
+    // the vendor handlers hop through lives on it for the module's lifetime.
+    s_dock = dock;
+    s_dispatcher = new QObject();
 
     blog(LOG_INFO, TAG "version: %s by SoraYuki https://github.com/sorayuki/obs-multi-rtmp/", PLUGIN_VERSION);
 
@@ -482,7 +845,12 @@ bool obs_module_load()
                 x->OnOBSEvent(event);
 
             if (event == obs_frontend_event::OBS_FRONTEND_EVENT_EXIT)
-            {   
+            {
+                // From here on a vendor request is refused instead of touching a dock that is going away.
+                // The requests are unregistered here, while obs-websocket's proc handler still exists:
+                // obs_module_unload may run after obs-websocket has unloaded and destroyed it.
+                s_shuttingDown = true;
+                UnregisterVendorApi();
                 dock->SaveConfig();
             }
             else if (event == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_CHANGED)
@@ -493,6 +861,21 @@ bool obs_module_load()
     );
 
     return true;
+}
+
+// obs-websocket asks for vendors to be registered here, after it has loaded itself.
+void obs_module_post_load()
+{
+    RegisterVendorApi();
+}
+
+// The dispatcher is kept: a vendor callback that passed the shutdown check may still
+// post to it, and the process is ending anyway. Every task re-checks s_dock. The vendor
+// requests were unregistered at OBS_FRONTEND_EVENT_EXIT, before obs-websocket could unload.
+void obs_module_unload()
+{
+    s_shuttingDown = true;
+    s_dock = nullptr;
 }
 
 const char *obs_module_description(void)

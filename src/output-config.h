@@ -70,7 +70,8 @@ inline T FindById(std::list<T>& list, const S& id) {
 
 MultiOutputConfig& GlobalMultiOutputConfig();
 
-void SaveMultiOutputConfig();
+// False when the profile has no path or the file could not be written; the in-memory config stays as it is.
+bool SaveMultiOutputConfig();
 
 bool LoadMultiOutputConfig();
 
